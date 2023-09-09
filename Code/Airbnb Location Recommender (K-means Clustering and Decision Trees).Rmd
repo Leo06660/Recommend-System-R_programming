@@ -1,0 +1,377 @@
+---
+title: "Airbnb Location Recommender: (1) K-means Clustering (2) Decision Trees"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+Import all library
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ggmap)
+library(tree)  # install.packages("tree")
+# install.packages('tinytex')
+########### data_dict ########### 
+data_dict <- function(data, print_table = "No"){
+  # packages
+  suppressPackageStartupMessages(suppressWarnings(require(tidyverse)))
+  suppressPackageStartupMessages(suppressWarnings(require(psych)))
+  suppressPackageStartupMessages(suppressWarnings(require(ggpubr)))
+  suppressPackageStartupMessages(suppressWarnings(require(gridExtra)))
+  # get rid of scientific notation
+  options(scipen = 999)
+  # Get variable info and NAs
+  var_info <- data.frame(Variable = names(data),
+                         VariableType = sapply(data, class),
+                         MissingValues = sapply(data, function(y) 
+                           sum(length(which(is.na(y))))),
+                         row.names = NULL)
+  # get descriptive stats
+  desc_stats <- data.frame(Variable = names(data), 
+                           describe(data)[c(2:5, 13, 8:10)], 
+                           row.names = NULL)
+  # Create the data dictionary
+  d_dict <- merge(var_info, desc_stats, by = "Variable")
+  d_dict <- d_dict %>% mutate_at(vars("mean":"range"), .fun = round, 2)
+  # NA's for summary stats of variables not of class numeric or integer
+  d_dict <- d_dict %>%
+    mutate(mean = ifelse(VariableType == "numeric" | VariableType == "integer", mean, ""),
+           sd = ifelse(VariableType == "numeric" | VariableType == "integer", sd, ""),
+           median = ifelse(VariableType == "numeric" | VariableType == "integer", median, ""),
+           se = ifelse(VariableType == "numeric" | VariableType == "integer", se, ""),
+           min = ifelse(VariableType == "numeric" | VariableType == "integer", min, ""),
+           max = ifelse(VariableType == "numeric" | VariableType == "integer", max, ""),
+           range = ifelse(VariableType == "numeric" | VariableType == "integer", range, ""))
+  # return the result
+  if(print_table == "No"){
+    return(d_dict)
+  } else {
+    #create table if table = TRUE
+    d_dict <- ggtexttable(d_dict,
+                          rows = NULL)
+    return(d_dict)
+  }
+}
+
+########### summarize_numeric ########### 
+summarize_numeric = function(dataset) {
+
+  dataset = select_if(dataset, is.numeric)
+  summary.table = data.frame(Attribute = names(dataset))
+
+  summary.table = summary.table %>%
+    mutate('Missing Values' = apply(dataset, 2, function (x) sum(is.na(x))),
+           'Unique Values' = apply(dataset, 2, function (x) length(unique(x))),
+           'Mean' = colMeans(dataset, na.rm = TRUE),
+           'Min' = apply(dataset, 2, function (x) min(x, na.rm = TRUE)),
+           'Max' = apply(dataset, 2, function (x) max(x, na.rm = TRUE)),
+           'SD' = apply(dataset, 2, function (x) sd(x, na.rm = TRUE))
+    )
+  summary.table
+}
+```
+
+Read final jointed table
+```{r}
+# final_data = as_tibble(read.csv("./data/all_jointed_data.csv"))
+final_data = as_tibble(read.csv("./input/all_data_v3.csv"))
+
+ggplot(final_data) + geom_bar(aes(x=neighbourhood_group)) 
+# data_dict(final_data, print_table = 'Yes')
+```
+
+convert price into unit price (price/room_type)
+```{r}
+# 4, 2, 2, 1
+final_data = final_data %>%
+  mutate(unit_price = ifelse(room_type=='Entire home/apt',price/4,ifelse(room_type=='Shared room',price,price/2)))
+# drop outlier
+final_data = final_data %>%
+  filter(unit_price<1100)
+
+```
+
+
+
+one-hot-encode room_type and neighbourhood
+(https://community.rstudio.com/t/factor-to-one-hot-encoding-aka-dummy-variables-using-logicals/69236/2)
+```{r}
+final_data_OHE = final_data %>%
+  mutate(n = 1) %>% 
+  pivot_wider(names_from = neighbourhood_group, values_from=n, values_fill=0) %>%
+  mutate(n = 1) %>% 
+  pivot_wider(names_from = room_type, values_from=n, values_fill=0)
+```
+
+Group by neighborhood and average on the other attributes
+```{r}
+final_data_OHE %>% filter(neighbourhood=='Hollywood Hills')
+grouped_neighbourhood_data = final_data_OHE %>%
+                                group_by(neighbourhood) %>% 
+                                summarise(shared_room_count = sum(`Shared room`),
+                                          private_room_count = sum(`Private room`),
+                                          Entire_home_apt_count = sum(`Entire home/apt`),
+                                          Hotel_room_count = sum(`Hotel room`),
+                                          avg_unit_price = mean(unit_price),
+                                          avg_crime_level = mean(crime_level),
+                                          avg_crime_incidents_count = mean(crime_incidents_count),
+                                          avg_rating = mean(avg_rating),
+                                          latitude = mean(latitude),
+                                          longitude = mean(longitude),
+                                          housing_count = n()
+                                          )
+
+```
+summarize the new grouping df
+```{r}
+# data_dict
+data_dict(grouped_neighbourhood_data, print_table = 'Yes')
+# summarize_numeric
+numeric_data = grouped_neighbourhood_data %>% select(avg_unit_price, avg_rating, avg_crime_level, avg_crime_incidents_count, shared_room_count, 	private_room_count, Entire_home_apt_count, Hotel_room_count)
+summarize_numeric(numeric_data)
+summarize_numeric(grouped_neighbourhood_data)
+```
+
+
+Plot avg_unit_price neighbourhood in LA map
+```{r}
+grouped_neighbourhood_data_roundprice = cbind(grouped_neighbourhood_data)
+grouped_neighbourhood_data_roundprice$avg_unit_price =
+  round(grouped_neighbourhood_data_roundprice$avg_unit_price, 0)
+height <- max(grouped_neighbourhood_data$latitude) - min(grouped_neighbourhood_data$latitude)
+width <- max(grouped_neighbourhood_data$longitude) - min(grouped_neighbourhood_data$longitude)
+LA_borders <- c(bottom  = min(grouped_neighbourhood_data$latitude)  - 0.1 * height, 
+                 top     = max(grouped_neighbourhood_data$latitude)  + 0.1 * height,
+                 left    = min(grouped_neighbourhood_data$longitude) - 0.1 * width,
+                 right   = max(grouped_neighbourhood_data$longitude) + 0.1 * width)
+ 
+map <- get_stamenmap(LA_borders, zoom = 10, maptype = "toner-lite")
+ggmap(map) +
+    geom_point(data = grouped_neighbourhood_data_roundprice, mapping = aes(x = longitude, y = latitude, color=factor(avg_unit_price), size=avg_unit_price))
+```
+
+
+exclude unimportant attributes 
+```{r}
+train_data = select(grouped_neighbourhood_data, -c(neighbourhood, housing_count, latitude, longitude))
+```
+
+Correlation matrix
+```{r}
+# install.packages("ggcorrplot")
+library(ggcorrplot)
+# cor_data = select(final_data, c(unit_price, availability_365, avg_rating, crime_level, crime_incidents_count))
+fullCorrMatrix = round(cor(train_data %>% select_if(is.numeric)), 2)
+ggcorrplot(fullCorrMatrix, lab = TRUE)
+```
+
+
+
+Elbow diagram
+```{r}
+wss = function (k) {kmeans(scale(train_data), k, nstart=10)$tot.withinss}
+wss_1_10 = map_dbl(1:10, wss) # with k from 1 to 10, means call wss function 10 times to do kmeans
+plot(1:10, wss_1_10)
+```
+Look at a clustering with k = 3
+```{r}
+res = kmeans(scale(train_data), 3, nstart=25)
+grouped_neighbourhood_data_res = grouped_neighbourhood_data %>% mutate(Cluster = res$cluster)
+ggplot(grouped_neighbourhood_data_res) + geom_bar(aes(x=Cluster)) 
+```
+
+
+summarise for each cluster
+```{r}
+# summarize_numeric = function(dataset) {
+#   
+#   dataset = select_if(dataset, is.numeric)
+#   summary.table = data.frame(Attribute = names(dataset))
+#   
+#   summary.table = summary.table %>% 
+#     mutate('Missing Values' = apply(dataset, 2, function (x) sum(is.na(x))),
+#            'Unique Values' = apply(dataset, 2, function (x) length(unique(x))),
+#            'Mean' = colMeans(dataset, na.rm = TRUE),
+#            'Min' = apply(dataset, 2, function (x) min(x, na.rm = TRUE)),
+#            'Max' = apply(dataset, 2, function (x) max(x, na.rm = TRUE)),
+#            'SD' = apply(dataset, 2, function (x) sd(x, na.rm = TRUE))
+#     )
+#   summary.table
+# }
+########## cluster1 #############
+grouped_neighbourhood_data_res %>%
+  filter(Cluster==1) %>%
+  summarize_numeric()
+########## cluster2 #############
+grouped_neighbourhood_data_res %>%
+  filter(Cluster==2) %>%
+  summarize_numeric()
+########## cluster3 #############
+grouped_neighbourhood_data_res %>%
+  filter(Cluster==3) %>%
+  summarize_numeric()
+```
+
+o
+```{r}
+library(ggplot2)  # The grammar of graphics package
+library(maps)     # Provides latitude and longitude data for various maps
+```
+
+o
+```{r}
+# ggplot(test1) + geom_point(aes(x=avg_severity_level, y = price, color=factor(Cluster), shape=factor(Cluster)))
+# ggplot(train_data_res) + geom_count(aes(x=longitude, y = latitude, color=factor(Cluster))) + ylim(33.6, 34.4) + xlim(-118.1, -118.7)
+# original
+# ggplot(train_data_res) + geom_count(aes(x=longitude, y = latitude)) + ylim(33.6, 34.4) + xlim(-118.1, -118.7)
+# ggplot(test1) + geom_histogram(aes(x=price)) + xlim(0,1000)
+# test1 = test1 %>%
+#   mutate(price_level = ifelse(price<=100,0,ifelse(price>200,2,1)))
+# ggplot(test1) + geom_bar(aes(x=price_level)) 
+# ggplot(test1) + geom_count(aes(x=longitude, y = latitude, color=factor(price_level))) + ylim(33.6, 34.4) + xlim(-118.1, -118.7)
+```
+
+o
+```{r}
+# MainStates <- map_data("county", region = 'california')
+# ggplot() + 
+#   geom_polygon( data=MainStates, aes(x=long, y=lat, group=group),
+#                 color="black", fill="lightyellow" )
+```
+
+Plot on LA map
+https://rstudio-pubs-static.s3.amazonaws.com/434852_bb92f97f268148a9b963754d8dc5d95a.html
+```{r}
+# install.packages('ggmap')
+library(ggmap)
+height <- max(grouped_neighbourhood_data$latitude) - min(grouped_neighbourhood_data$latitude)
+width <- max(grouped_neighbourhood_data$longitude) - min(grouped_neighbourhood_data$longitude)
+LA_borders <- c(bottom  = min(grouped_neighbourhood_data$latitude)  - 0.1 * height, 
+                 top     = max(grouped_neighbourhood_data$latitude)  + 0.1 * height,
+                 left    = min(grouped_neighbourhood_data$longitude) - 0.1 * width,
+                 right   = max(grouped_neighbourhood_data$longitude) + 0.1 * width)
+ 
+map <- get_stamenmap(LA_borders, zoom = 10, maptype = "toner-lite")
+ggmap(map) +
+    geom_point(data = grouped_neighbourhood_data_res, mapping = aes(x = longitude, y = latitude, color=factor(Cluster), size=housing_count))
+```
+#########################################################################################################
+
+Whole
+```{r}
+train_DT = select(grouped_neighbourhood_data_res, -c(neighbourhood))
+regr_tree= tree(factor(Cluster) ~ .-Cluster, data=train_DT) 
+plot(regr_tree); text(regr_tree, pretty=0)
+```
+
+cluster 1 DT
+```{r}
+data_c1 = grouped_neighbourhood_data_res %>%
+  filter(Cluster==1)
+train_DT = select(data_c1, -c(neighbourhood))
+regr_tree= tree(avg_unit_price ~ .-avg_unit_price, data=data_c1) 
+plot(regr_tree); text(regr_tree, pretty=0)
+```
+
+cluster 2 DT
+```{r}
+data_c2 = grouped_neighbourhood_data_res %>%
+  filter(Cluster==2)
+train_DT = select(data_c2, -c(neighbourhood))
+regr_tree= tree(avg_unit_price ~ .-avg_unit_price, data=data_c2) 
+plot(regr_tree); text(regr_tree, pretty=0)
+```
+
+cluster 3 DT
+```{r}
+data_c3 = grouped_neighbourhood_data_res %>%
+  filter(Cluster==3)
+train_DT = select(data_c3, -c(neighbourhood))
+regr_tree= tree(avg_unit_price ~ .-avg_unit_price, data=data_c3) 
+plot(regr_tree); text(regr_tree, pretty=0)
+```
+#########################################################################################################
+#########################################################################################################
+(Only include cities of LA)
+Group by neighborhood and average on the other attributes
+```{r}
+final_data_OHE = final_data %>%
+  mutate(n = 1) %>% 
+  pivot_wider(names_from = room_type, values_from=n, values_fill=0)
+
+final_data_OHE_LA = final_data_OHE %>%
+  filter(neighbourhood_group=='City of Los Angeles')
+
+# final_data_OHE_LA %>% filter(neighbourhood=='Hollywood Hills')
+grouped_neighbourhood_LA = final_data_OHE_LA %>%
+                                group_by(neighbourhood) %>% 
+                                summarise(shared_room_count = sum(`Shared room`),
+                                          private_room_count = sum(`Private room`),
+                                          Entire_home_apt_count = sum(`Entire home/apt`),
+                                          Hotel_room_count = sum(`Hotel room`),
+                                          avg_unit_price = mean(unit_price),
+                                          avg_crime_level = mean(crime_level),
+                                          avg_crime_incidents_count = mean(crime_incidents_count),
+                                          avg_rating = mean(avg_rating),
+                                          latitude = mean(latitude),
+                                          longitude = mean(longitude),
+                                          housing_count = n())
+train_data = select(grouped_neighbourhood_LA, -c(neighbourhood, housing_count, latitude, longitude))
+```
+
+o
+```{r}
+fullCorrMatrix = round(cor(train_data %>% select_if(is.numeric)), 2)
+ggcorrplot(fullCorrMatrix, lab = TRUE)
+```
+
+o
+```{r}
+wss = function (k) {kmeans(scale(train_data), k, nstart=10)$tot.withinss}
+wss_1_10 = map_dbl(1:10, wss) # with k from 1 to 10, means call wss function 10 times to do kmeans
+plot(1:10, wss_1_10)
+```
+
+o
+```{r}
+res = kmeans(scale(train_data), 3, nstart=25)
+grouped_neighbourhood_data_res = grouped_neighbourhood_LA %>% mutate(Cluster = res$cluster)
+ggplot(grouped_neighbourhood_data_res) + geom_bar(aes(x=Cluster)) 
+```
+
+o
+```{r}
+########## cluster1 #############
+grouped_neighbourhood_data_res %>%
+  filter(Cluster==1) %>%
+  summarize_numeric()
+########## cluster2 #############
+grouped_neighbourhood_data_res %>%
+  filter(Cluster==2) %>%
+  summarize_numeric()
+########## cluster3 #############
+grouped_neighbourhood_data_res %>%
+  filter(Cluster==3) %>%
+  summarize_numeric()
+```
+
+o
+```{r}
+height <- max(grouped_neighbourhood_LA$latitude) - min(grouped_neighbourhood_LA$latitude)
+width <- max(grouped_neighbourhood_LA$longitude) - min(grouped_neighbourhood_LA$longitude)
+LA_borders <- c(bottom  = min(grouped_neighbourhood_LA$latitude)  - 0.1 * height, 
+                 top     = max(grouped_neighbourhood_LA$latitude)  + 0.1 * height,
+                 left    = min(grouped_neighbourhood_LA$longitude) - 0.1 * width,
+                 right   = max(grouped_neighbourhood_LA$longitude) + 0.1 * width)
+ 
+map <- get_stamenmap(LA_borders, zoom = 10, maptype = "toner-lite")
+ggmap(map) +
+    geom_point(data = grouped_neighbourhood_data_res, mapping = aes(x = longitude, y = latitude, color=factor(Cluster), size=housing_count))
+```
+
+o
+```{r}
+
+```
